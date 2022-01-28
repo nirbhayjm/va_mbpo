@@ -9,5 +9,7 @@ hid_size: 200
 deterministic: false
 propagation_method: random_model
 learn_logvar_bounds: false  # so far this works better
+va_loss_coeff: 0.01
+va_norm: l1
 activation_fn_cfg:
   _target_: torch.nn.SiLU

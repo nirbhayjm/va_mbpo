@@ -5,9 +5,27 @@ import torch
 class ReplayBuffer(object):
     """Buffer to store environment transitions."""
 
+    __slots__ = [
+        "capacity",
+        "device",
+        "obs_shape",
+        "action_shape",
+        "obses",
+        "next_obses",
+        "actions",
+        "rewards",
+        "not_dones",
+        "not_dones_no_max",
+        "idx",
+        "last_save",
+        "full",
+    ]
+
     def __init__(self, obs_shape, action_shape, capacity, device):
         self.capacity = capacity
         self.device = device
+        self.obs_shape = obs_shape
+        self.action_shape = action_shape
 
         # the proprioceptive obs is stored as float32, pixels obs as uint8
         obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
@@ -25,6 +43,20 @@ class ReplayBuffer(object):
 
     def __len__(self):
         return self.capacity if self.full else self.idx
+
+    def clear_all_contents(self):
+        obs_dtype = np.float32 if len(self.obs_shape) == 1 else np.uint8
+
+        self.obses = np.empty((self.capacity, *self.obs_shape), dtype=obs_dtype)
+        self.next_obses = np.empty((self.capacity, *self.obs_shape), dtype=obs_dtype)
+        self.actions = np.empty((self.capacity, *self.action_shape), dtype=np.float32)
+        self.rewards = np.empty((self.capacity, 1), dtype=np.float32)
+        self.not_dones = np.empty((self.capacity, 1), dtype=np.float32)
+        self.not_dones_no_max = np.empty((self.capacity, 1), dtype=np.float32)
+
+        self.idx = 0
+        self.last_save = 0
+        self.full = False
 
     def add(self, obs, action, reward, next_obs, done, done_no_max):
         np.copyto(self.obses[self.idx], obs)

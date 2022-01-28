@@ -10,10 +10,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import tqdm
-from torch import optim as optim
-
 from mbrl.util.logger import Logger
 from mbrl.util.replay_buffer import BootstrapIterator, TransitionIterator
+from torch import optim as optim
 
 from .model import Model
 
@@ -47,17 +46,21 @@ class ModelTrainer:
         weight_decay: float = 1e-5,
         optim_eps: float = 1e-8,
         logger: Optional[Logger] = None,
+        model_loss_type: Optional[str] = "mle",
+        value_update_interval: Optional[int] = 0,
+        agent=None,
     ):
         self.model = model
         self._train_iteration = 0
+        assert model_loss_type in ["mle", "va"]
+        self.model_loss_type = model_loss_type
+        self._value_update_interval = value_update_interval
+        self._agent = agent
 
         self.logger = logger
         if self.logger:
             self.logger.register_group(
-                self._LOG_GROUP_NAME,
-                MODEL_LOG_FORMAT,
-                color="blue",
-                dump_frequency=1,
+                self._LOG_GROUP_NAME, MODEL_LOG_FORMAT, color="blue", dump_frequency=1,
             )
 
         self.optimizer = optim.Adam(
@@ -78,6 +81,8 @@ class ModelTrainer:
         batch_callback: Optional[Callable] = None,
         evaluate: bool = True,
         silent: bool = False,
+        va_refit_callable: Optional[Callable] = None,
+        va_refit_callable_args: Dict = {},
     ) -> Tuple[List[float], List[float]]:
         """Trains the model for some number of epochs.
 
@@ -143,6 +148,19 @@ class ModelTrainer:
         # otherwise it produces too much output
         disable_tqdm = silent or (num_epochs is None or num_epochs > 1)
 
+        n_model_updates = 0
+        n_critic_updates = 0
+        if va_refit_callable is not None:
+            num_v_updates_in_model = va_refit_callable_args.pop(
+                "num_v_updates_in_model"
+            )
+            logger = va_refit_callable_args.pop("logger")
+            original_batch_size = va_refit_callable_args.pop("batch_size")
+            agent = va_refit_callable_args["agent"]
+            sac_buffer = va_refit_callable_args["sac_buffer"]
+        else:
+            assert self._value_update_interval == 0
+
         for epoch in epoch_iter:
             if batch_callback:
                 batch_callback_epoch = functools.partial(batch_callback, epoch)
@@ -150,10 +168,41 @@ class ModelTrainer:
                 batch_callback_epoch = None
             batch_losses: List[float] = []
             for batch in tqdm.tqdm(dataset_train, disable=disable_tqdm):
-                loss, meta = self.model.update(batch, self.optimizer)
+                loss, meta = self.model.update(
+                    batch, self.optimizer, model_loss_type=self.model_loss_type
+                )
+                n_model_updates += 1
                 batch_losses.append(loss)
                 if batch_callback_epoch:
                     batch_callback_epoch(loss, meta, "train")
+
+                if (
+                    self._value_update_interval > 0
+                    and n_model_updates > 0
+                    and n_model_updates % self._value_update_interval == 0
+                ):
+                    sac_buffer.clear_all_contents()
+                    model_len = (
+                        len(self.model.model.elite_models)
+                        if self.model.model.elite_models is not None
+                        else len(self.model.model)
+                    )
+                    va_refit_batch_size = (
+                        original_batch_size
+                        + model_len
+                        - (original_batch_size % model_len)
+                    )
+                    va_refit_callable(
+                        **va_refit_callable_args, batch_size=va_refit_batch_size
+                    )
+
+                    # Agent's value function update
+                    for _ in range(num_v_updates_in_model):
+                        agent.update_critic_from_buffer(
+                            sac_buffer, logger, n_critic_updates
+                        )
+                        n_critic_updates += 1
+
             total_avg_loss = np.mean(batch_losses).mean().item()
             training_losses.append(total_avg_loss)
 
@@ -192,6 +241,7 @@ class ModelTrainer:
                         if best_val_score is not None
                         else 0,
                     },
+                    commit=False,
                 )
             if callback:
                 callback(

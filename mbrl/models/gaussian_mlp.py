@@ -6,12 +6,11 @@ import pathlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import hydra
+import mbrl.util.math
 import omegaconf
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
-
-import mbrl.util.math
 
 from .model import Ensemble
 from .util import EnsembleLinearLayer, truncated_normal_init
@@ -78,6 +77,8 @@ class GaussianMLP(Ensemble):
         propagation_method: Optional[str] = None,
         learn_logvar_bounds: bool = False,
         activation_fn_cfg: Optional[Union[Dict, omegaconf.DictConfig]] = None,
+        va_norm: Optional[str] = "l1",
+        va_loss_coeff: Optional[float] = 1e-2,
     ):
         super().__init__(
             ensemble_size, device, propagation_method, deterministic=deterministic
@@ -85,6 +86,8 @@ class GaussianMLP(Ensemble):
 
         self.in_size = in_size
         self.out_size = out_size
+        self._va_norm = va_norm
+        self._va_loss_coeff = va_loss_coeff
 
         def create_activation():
             if activation_fn_cfg is None:
@@ -104,8 +107,7 @@ class GaussianMLP(Ensemble):
         for i in range(num_layers - 1):
             hidden_layers.append(
                 nn.Sequential(
-                    create_linear_layer(hid_size, hid_size),
-                    create_activation(),
+                    create_linear_layer(hid_size, hid_size), create_activation(),
                 )
             )
         self.hidden_layers = nn.Sequential(*hidden_layers)
@@ -125,6 +127,10 @@ class GaussianMLP(Ensemble):
         self.to(self.device)
 
         self.elite_models: List[int] = None
+
+    def set_agent(self, agent):
+        """Custom function required by value-aware objectives"""
+        self._agent = agent
 
     def _maybe_toggle_layers_use_only_elite(self, only_elite: bool):
         if self.elite_models is None:
@@ -304,10 +310,108 @@ class GaussianMLP(Ensemble):
         nll += 0.01 * (self.max_logvar.sum() - self.min_logvar.sum())
         return nll
 
+    def _va_loss(
+        self,
+        model_in: torch.Tensor,
+        target: torch.Tensor,
+        action: torch.Tensor,
+        current_state: torch.Tensor,
+        next_state: torch.Tensor,
+        target_is_delta: bool,
+        no_delta_list: bool,
+        eval_mode: Optional[bool] = False,
+    ) -> torch.Tensor:
+        assert model_in.ndim == target.ndim
+        if model_in.ndim == 2:  # add model dimension
+            model_in = model_in.unsqueeze(0)
+            target = target.unsqueeze(0)
+
+        # assert self._agent != None and hasattr(self._agent, 'critic')
+        if self.deterministic:
+            pred_ns_and_reward_sample, _ = self.forward(model_in, use_propagation=False)
+        else:
+            pred_ns_and_reward_mean, pred_ns_and_reward_logvar = self.forward(
+                model_in, use_propagation=False
+            )
+            pred_ns_and_reward_dist = torch.distributions.normal.Normal(
+                loc=pred_ns_and_reward_mean,
+                scale=torch.exp(0.5 * pred_ns_and_reward_logvar),
+            )
+            pred_ns_and_reward_sample = pred_ns_and_reward_dist.rsample()
+
+        pred_ns_target_sample = pred_ns_and_reward_sample[:, :, :-1]
+        pred_reward_sample = pred_ns_and_reward_sample[:, :, -1]
+
+        if target_is_delta:
+            pred_ns_sample = pred_ns_target_sample + current_state
+            for dim in no_delta_list:
+                pred_ns_sample[..., dim] = pred_ns_target_sample[..., dim]
+        else:
+            pred_ns_sample = pred_ns_target_sample
+
+        if hasattr(self._agent, "actor"):
+            action_at_pred_ns = self._agent.actor(pred_ns_sample).sample()
+            pred_ns_qvalue1, pred_ns_qvalue2 = self._agent.critic(
+                pred_ns_sample, action_at_pred_ns
+            )
+            pred_ns_qvalue = pred_ns_qvalue1
+        elif hasattr(self._agent, "plan"):
+            raise NotImplementedError(
+                f"Value-aware model learning only supported"
+                " for hybrid (i.e. actor-critic) model-based algorithms"
+            )
+        else:
+            raise RuntimeError(f"Agent class not recognized: {type(self._agent)}")
+
+        # Shape: (num_members, batch_size, 1)
+        action_at_gt_ns = self._agent.actor(next_state).sample()
+        gt_ns_qvalue1, gt_ns_qvalue2 = self._agent.critic(next_state, action_at_gt_ns)
+        gt_ns_qvalue = gt_ns_qvalue1
+        # Shape: (batch_size, 1)
+        gt_ns_qvalue = gt_ns_qvalue.unsqueeze(0)
+        # Shape: (1, batch_size, 1)
+
+        model_advantage = gt_ns_qvalue - pred_ns_qvalue
+
+        if self._va_norm == "l2":
+            va_loss_batch = torch.square(model_advantage)
+        elif self._va_norm == "l1":
+            va_loss_batch = torch.abs(model_advantage)
+        else:
+            raise ValueError(f"{self._va_norm}")
+
+        target_reward = target[:, :, -1]
+
+        if eval_mode:
+            return self._va_loss_coeff * va_loss_batch
+
+        else:
+            va_loss = va_loss_batch.sum()
+            reward_loss = (
+                F.mse_loss(pred_reward_sample, target_reward, reduction="none")
+                .sum(1)
+                .sum()
+            )
+
+            loss = (self._va_loss_coeff * va_loss) + reward_loss
+            with torch.no_grad():
+                metadata = {
+                    "va_loss": va_loss.item(),
+                    "ma_raw": model_advantage.mean().item(),
+                    "reward_loss": reward_loss.item(),
+                }
+            return loss, metadata
+
     def loss(
         self,
         model_in: torch.Tensor,
         target: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        current_state: Optional[torch.Tensor] = None,
+        next_state: Optional[torch.Tensor] = None,
+        target_is_delta: Optional[bool] = False,
+        no_delta_list: Optional[list] = [],
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes Gaussian NLL loss.
 
@@ -330,12 +434,46 @@ class GaussianMLP(Ensemble):
             the average over all models.
         """
         if self.deterministic:
-            return self._mse_loss(model_in, target), {}
+            if model_loss_type == "mle":
+                return self._mse_loss(model_in=model_in, target=target), {}
+            elif model_loss_type == "va":
+                return self._va_loss(
+                    model_in=model_in,
+                    target=target,
+                    action=action,
+                    current_state=current_state,
+                    next_state=next_state,
+                    target_is_delta=target_is_delta,
+                    no_delta_list=no_delta_list,
+                )
+            else:
+                raise ValueError(f"{model_loss_type}")
         else:
-            return self._nll_loss(model_in, target), {}
+            if model_loss_type == "mle":
+                return self._nll_loss(model_in=model_in, target=target), {}
+            elif model_loss_type == "va":
+                return self._va_loss(
+                    model_in=model_in,
+                    target=target,
+                    action=action,
+                    current_state=current_state,
+                    next_state=next_state,
+                    target_is_delta=target_is_delta,
+                    no_delta_list=no_delta_list,
+                )
+            else:
+                raise ValueError(f"{model_loss_type}")
 
     def eval_score(  # type: ignore
-        self, model_in: torch.Tensor, target: Optional[torch.Tensor] = None
+        self,
+        model_in: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        current_state: Optional[torch.Tensor] = None,
+        next_state: Optional[torch.Tensor] = None,
+        target_is_delta: Optional[bool] = False,
+        no_delta_list: Optional[list] = [],
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes the squared error for the model over the given input/target.
 
@@ -356,9 +494,27 @@ class GaussianMLP(Ensemble):
         """
         assert model_in.ndim == 2 and target.ndim == 2
         with torch.no_grad():
-            pred_mean, _ = self.forward(model_in, use_propagation=False)
-            target = target.repeat((self.num_members, 1, 1))
-            return F.mse_loss(pred_mean, target, reduction="none"), {}
+            if model_loss_type == "mle":
+                pred_mean, _ = self.forward(model_in, use_propagation=False)
+                target = target.unsqueeze(0).repeat((self.num_members, 1, 1))
+                return F.mse_loss(pred_mean, target, reduction="none"), {}
+
+            elif model_loss_type == "ma":
+                return (
+                    self._va_loss(
+                        model_in=model_in,
+                        target=target,
+                        action=action,
+                        current_state=current_state,
+                        next_state=next_state,
+                        target_is_delta=target_is_delta,
+                        no_delta_list=no_delta_list,
+                        eval_mode=True,
+                    ),
+                    {},
+                )
+            else:
+                raise ValueError(f"{model_loss_type}")
 
     def sample_propagation_indices(
         self, batch_size: int, _rng: torch.Generator

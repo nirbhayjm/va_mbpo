@@ -5,10 +5,12 @@
 import collections
 import csv
 import pathlib
-from typing import Counter, Dict, List, Mapping, Tuple, Union
+from typing import Counter, Dict, List, Mapping, Optional, Tuple, Union
 
 import termcolor
 import torch
+import wandb
+from mbrl.util.timer import Timer
 
 LogFormatType = List[Tuple[str, str, str]]
 LogTypes = Union[int, float, torch.Tensor]
@@ -27,6 +29,18 @@ SAC_TRAIN_LOG_FORMAT = [
     ("alpha_value", "TVAL", "float"),
     ("actor_entropy", "AENT", "float"),
 ]
+
+
+def init_wandb(wandb_name, project_name, config={}, group=None, resume=False):
+    config = dict(config).copy()
+
+    wandb_run = wandb.init(
+        project=project_name, config=config, group=group, resume=resume
+    )
+
+    wandb_run_name = wandb_name
+    wandb_run.name = wandb_run_name
+    wandb_run.save()
 
 
 class AverageMeter(object):
@@ -118,7 +132,14 @@ class Logger(object):
     """
 
     def __init__(
-        self, log_dir: Union[str, pathlib.Path], enable_back_compatible: bool = False
+        self,
+        log_dir: Union[str, pathlib.Path],
+        enable_back_compatible: bool = False,
+        use_wandb: Optional[bool] = False,
+        wandb_name: Optional[str] = "default",
+        wandb_project_name: Optional[str] = "va_mbpo",
+        wandb_config: Optional[dict] = {},
+        wandb_commit_interval_in_secs: Optional[int] = 300,
     ):
         self._log_dir = pathlib.Path(log_dir)
         self._groups: Dict[str, Tuple[MetersGroup, int, str]] = {}
@@ -127,6 +148,22 @@ class Logger(object):
         if enable_back_compatible:
             self.register_group("train", SAC_TRAIN_LOG_FORMAT)
             self.register_group("eval", EVAL_LOG_FORMAT, color="green")
+
+        self.use_wandb = use_wandb
+        self._wandb_step = -1
+        self._wandb_result_step = -1
+        self._wandb_commit_interval_in_secs = wandb_commit_interval_in_secs
+        self._wandb_commit_timer = None
+
+        self.wandb_log_buffer = []
+        if self.use_wandb:
+            assert type(wandb_config) == dict
+            init_wandb(
+                wandb_name=wandb_name,
+                project_name=wandb_project_name,
+                config=wandb_config,
+                group=None,
+            )
 
     def register_group(
         self,
@@ -164,7 +201,13 @@ class Logger(object):
     def log_param(self, *_args):
         pass
 
-    def log_data(self, group_name: str, data: Mapping[str, LogTypes]):
+    def log_data(
+        self,
+        group_name: str,
+        data: Mapping[str, LogTypes],
+        commit: Optional[bool] = False,
+        exclude_wandb_log_keys: List[str] = [],
+    ):
         """Logs the data contained in a given dictionary to the given logging group.
 
         Args:
@@ -176,13 +219,49 @@ class Logger(object):
         if group_name not in self._groups:
             raise ValueError(f"Group {group_name} has not been registered.")
         meter_group, dump_frequency, color = self._groups[group_name]
+
+        wandb_dict = {}
         for key, value in data.items():
             if isinstance(value, torch.Tensor):
                 value = value.item()  # type: ignore
             meter_group.log(key, value)
+            if self.use_wandb and key not in exclude_wandb_log_keys:
+                wandb_dict[f"{group_name}/{key}"] = value
+
         self._group_steps[group_name] += 1
         if self._group_steps[group_name] % dump_frequency == 0:
             self._dump(group_name)
+
+        if self.use_wandb:
+            self._wandb_step += 1
+            if self._wandb_commit_timer is None:
+                # Init timer
+                self._wandb_commit_timer = Timer(
+                    name="wandb_commit", max_num_record=50, verbose=False,
+                )
+                self._wandb_commit_timer.start()
+                do_commit = True
+            else:
+                do_commit = False
+                curr_elapsed_time = self._wandb_commit_timer.get_elapsed_time()
+                if commit and curr_elapsed_time > self._wandb_commit_interval_in_secs:
+                    do_commit = True
+                    self._wandb_commit_timer.stop()
+                    self._wandb_commit_timer.start()
+
+            self.wandb_log_wrapper(wandb_dict, do_commit, step=self._wandb_step)
+
+    def wandb_log_wrapper(self, wandb_dict, commit, step):
+        self.wandb_log_buffer.append((wandb_dict, step))
+        if commit:
+            self.clear_wandb_buffer()
+
+    def clear_wandb_buffer(self):
+        buffer_len = len(self.wandb_log_buffer)
+        for idx, (idx_wandb_dict, idx_step) in enumerate(self.wandb_log_buffer):
+            wandb_commit = True if idx == buffer_len - 1 else False
+            wandb.log(idx_wandb_dict, commit=wandb_commit, step=idx_step)
+        self.wandb_log_buffer = []
 
     def _dump(self, group_name: str, save: bool = True):
         if group_name not in self._groups:

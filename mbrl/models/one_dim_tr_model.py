@@ -5,12 +5,11 @@
 import pathlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import numpy as np
-import torch
-
 import mbrl.models.util as model_util
 import mbrl.types
 import mbrl.util.math
+import numpy as np
+import torch
 
 from .model import Ensemble, Model
 
@@ -100,10 +99,11 @@ class OneDTransitionRewardModel(Model):
         if not num_elites and isinstance(self.model, Ensemble):
             self.num_elites = self.model.num_members
 
+    def set_agent(self, agent):
+        self.model.set_agent(agent)
+
     def _get_model_input(
-        self,
-        obs: mbrl.types.TensorType,
-        action: mbrl.types.TensorType,
+        self, obs: mbrl.types.TensorType, action: mbrl.types.TensorType,
     ) -> torch.Tensor:
         if self.obs_process_fn:
             obs = self.obs_process_fn(obs)
@@ -119,6 +119,11 @@ class OneDTransitionRewardModel(Model):
         self, batch: mbrl.types.TransitionBatch, _as_float: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         obs, action, next_obs, reward, _ = batch.astuple()
+        extras = {
+            "action": torch.from_numpy(action).float().to(self.device),
+            "current_state": torch.from_numpy(obs).float().to(self.device),
+            "next_state": torch.from_numpy(next_obs).float().to(self.device),
+        }
         if self.target_is_delta:
             target_obs = next_obs - obs
             for dim in self.no_delta_list:
@@ -133,7 +138,7 @@ class OneDTransitionRewardModel(Model):
             target = torch.cat([target_obs, reward], dim=obs.ndim - 1)
         else:
             target = target_obs
-        return model_in.float(), target.float()
+        return model_in.float(), target.float(), extras
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, ...]:
         """Calls forward method of base model with the given input and args."""
@@ -165,6 +170,7 @@ class OneDTransitionRewardModel(Model):
         self,
         batch: mbrl.types.TransitionBatch,
         target: Optional[torch.Tensor] = None,
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes the model loss over a batch of transitions.
 
@@ -179,14 +185,25 @@ class OneDTransitionRewardModel(Model):
             (tensor and optional dict): as returned by `model.loss().`
         """
         assert target is None
-        model_in, target = self._process_batch(batch)
-        return self.model.loss(model_in, target=target)
+        model_in, target, extras = self._process_batch(batch)
+        return self.model.loss(
+            model_in,
+            target=target,
+            action=extras["action"],
+            next_state=extras["next_state"],
+            current_state=extras["current_state"],
+            target_is_delta=self.target_is_delta,
+            no_delta_list=self.no_delta_list,
+            model_loss_type=model_loss_type,
+            extras=extras,
+        )
 
     def update(
         self,
         batch: mbrl.types.TransitionBatch,
         optimizer: torch.optim.Optimizer,
         target: Optional[torch.Tensor] = None,
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Updates the model given a batch of transitions and an optimizer.
 
@@ -198,13 +215,24 @@ class OneDTransitionRewardModel(Model):
             (tensor and optional dict): as returned by `model.loss().`
         """
         assert target is None
-        model_in, target = self._process_batch(batch)
-        return self.model.update(model_in, optimizer, target=target)
+        model_in, target, extras = self._process_batch(batch)
+        return self.model.update(
+            model_in,
+            optimizer,
+            target=target,
+            action=extras["action"],
+            next_state=extras["next_state"],
+            current_state=extras["current_state"],
+            target_is_delta=self.target_is_delta,
+            no_delta_list=self.no_delta_list,
+            model_loss_type=model_loss_type,
+        )
 
     def eval_score(
         self,
         batch: mbrl.types.TransitionBatch,
         target: Optional[torch.Tensor] = None,
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Evaluates the model score over a batch of transitions.
 
@@ -219,8 +247,17 @@ class OneDTransitionRewardModel(Model):
         """
         assert target is None
         with torch.no_grad():
-            model_in, target = self._process_batch(batch)
-            return self.model.eval_score(model_in, target=target)
+            model_in, target, extras = self._process_batch(batch)
+            return self.model.eval_score(
+                model_in,
+                target=target,
+                action=extras["action"],
+                next_state=extras["next_state"],
+                current_state=extras["current_state"],
+                target_is_delta=self.target_is_delta,
+                no_delta_list=self.no_delta_list,
+                model_loss_type=model_loss_type,
+            )
 
     def get_output_and_targets(
         self, batch: mbrl.types.TransitionBatch
@@ -238,7 +275,7 @@ class OneDTransitionRewardModel(Model):
             (tuple(tensor), tensor): the model outputs and the target for this batch.
         """
         with torch.no_grad():
-            model_in, target = self._process_batch(batch)
+            model_in, target, extras = self._process_batch(batch)
             output = self.model.forward(model_in)
         return output, target
 

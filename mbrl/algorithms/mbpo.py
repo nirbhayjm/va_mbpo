@@ -7,10 +7,6 @@ from typing import Optional, Tuple, cast
 
 import gym
 import hydra.utils
-import numpy as np
-import omegaconf
-import torch
-
 import mbrl.constants
 import mbrl.models
 import mbrl.planning
@@ -19,7 +15,11 @@ import mbrl.types
 import mbrl.util
 import mbrl.util.common
 import mbrl.util.math
+import numpy as np
+import omegaconf
+import torch
 from mbrl.planning.sac_wrapper import SACAgent
+from omegaconf import OmegaConf
 
 MBPO_LOG_FORMAT = mbrl.constants.EVAL_LOG_FORMAT + [
     ("epoch", "E", "int"),
@@ -40,8 +40,7 @@ def rollout_model_and_populate_sac_buffer(
     batch = replay_buffer.sample(batch_size)
     initial_obs, *_ = cast(mbrl.types.TransitionBatch, batch).astuple()
     model_state = model_env.reset(
-        initial_obs_batch=cast(np.ndarray, initial_obs),
-        return_as_np=True,
+        initial_obs_batch=cast(np.ndarray, initial_obs), return_as_np=True,
     )
     accum_dones = np.zeros(initial_obs.shape[0], dtype=bool)
     obs = initial_obs
@@ -128,7 +127,17 @@ def train(
 
     work_dir = work_dir or os.getcwd()
     # enable_back_compatible to use pytorch_sac agent
-    logger = mbrl.util.Logger(work_dir, enable_back_compatible=True)
+    logger = mbrl.util.Logger(
+        work_dir,
+        enable_back_compatible=True,
+        use_wandb=bool(cfg.get("use_wandb", 0)),
+        wandb_name=cfg.experiment,
+        wandb_project_name=cfg.wandb_project_name,
+        wandb_config=OmegaConf.to_container(cfg, resolve=False),
+        wandb_commit_interval_in_secs=cfg.overrides.get(
+            "wandb_commit_interval_in_secs", 300
+        ),
+    )
     logger.register_group(
         mbrl.constants.RESULTS_LOG_NAME,
         MBPO_LOG_FORMAT,
@@ -145,6 +154,7 @@ def train(
 
     # -------------- Create initial overrides. dataset --------------
     dynamics_model = mbrl.util.common.create_one_dim_tr_model(cfg, obs_shape, act_shape)
+    dynamics_model.set_agent(agent)
     use_double_dtype = cfg.algorithm.get("normalize_double_precision", False)
     dtype = np.double if use_double_dtype else np.float32
     replay_buffer = mbrl.util.common.create_replay_buffer(
@@ -183,6 +193,9 @@ def train(
         optim_lr=cfg.overrides.model_lr,
         weight_decay=cfg.overrides.model_wd,
         logger=None if silent else logger,
+        model_loss_type=cfg.overrides.model_loss_type,
+        value_update_interval=cfg.overrides.get("value_update_interval", 5),
+        agent=agent,
     )
     best_eval_reward = -np.inf
     epoch = 0
@@ -214,11 +227,26 @@ def train(
             # --------------- Model Training -----------------
             if (env_steps + 1) % cfg.overrides.freq_train_model == 0:
                 mbrl.util.common.train_model_and_save_model_and_data(
-                    dynamics_model,
-                    model_trainer,
-                    cfg.overrides,
-                    replay_buffer,
+                    model=dynamics_model,
+                    model_trainer=model_trainer,
+                    cfg=cfg.overrides,
+                    replay_buffer=replay_buffer,
                     work_dir=work_dir,
+                    env_steps=env_steps,
+                    va_refit_callable=rollout_model_and_populate_sac_buffer,
+                    va_refit_callable_args=dict(
+                        model_env=model_env,
+                        replay_buffer=replay_buffer,
+                        agent=agent,
+                        sac_buffer=sac_buffer,
+                        sac_samples_action=cfg.algorithm.sac_samples_action,
+                        rollout_horizon=rollout_length,
+                        batch_size=cfg.overrides.get("v_update_batch_size", 50000),
+                        num_v_updates_in_model=cfg.overrides.get(
+                            "num_v_updates_in_model", 5
+                        ),
+                        logger=logger,
+                    ),
                 )
 
                 # --------- Rollout new model and store imagined trajectories --------
@@ -265,6 +293,7 @@ def train(
                         "episode_reward": avg_reward,
                         "rollout_length": rollout_length,
                     },
+                    commit=True,
                 )
                 if avg_reward > best_eval_reward:
                     video_recorder.save(f"{epoch}.mp4")

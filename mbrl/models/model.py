@@ -7,10 +7,10 @@ import pathlib
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
-from torch import nn as nn
-
 from mbrl.models.util import to_tensor
 from mbrl.types import ModelInput, TransitionBatch
+from torch import nn as nn
+from torch.nn.utils import clip_grad_norm_
 
 
 # ---------------------------------------------------------------------------
@@ -39,10 +39,7 @@ class Model(nn.Module, abc.ABC):
     _MODEL_FNAME = "model.pth"
 
     def __init__(
-        self,
-        device,
-        *args,
-        **kwargs,
+        self, device, *args, **kwargs,
     ):
         super().__init__()
         self.device = device
@@ -82,6 +79,8 @@ class Model(nn.Module, abc.ABC):
         self,
         model_in: ModelInput,
         target: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes a loss that can be used to update the model using backpropagation.
 
@@ -99,7 +98,10 @@ class Model(nn.Module, abc.ABC):
 
     @abc.abstractmethod
     def eval_score(
-        self, model_in: ModelInput, target: Optional[torch.Tensor] = None
+        self,
+        model_in: ModelInput,
+        target: Optional[torch.Tensor] = None,
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Computes an evaluation score for the model over the given input/target.
 
@@ -129,7 +131,13 @@ class Model(nn.Module, abc.ABC):
         self,
         model_in: ModelInput,
         optimizer: torch.optim.Optimizer,
+        action: torch.Tensor,
+        current_state: torch.Tensor,
+        next_state: torch.Tensor,
+        target_is_delta: bool,
+        no_delta_list: list,
         target: Optional[torch.Tensor] = None,
+        model_loss_type: Optional[str] = "mle",
     ) -> Tuple[float, Dict[str, Any]]:
         """Updates the model using backpropagation with given input and target tensors.
 
@@ -154,8 +162,20 @@ class Model(nn.Module, abc.ABC):
         """
         self.train()
         optimizer.zero_grad()
-        loss, meta = self.loss(model_in, target)
+        loss, meta = self.loss(
+            model_in,
+            target,
+            action=action,
+            current_state=current_state,
+            next_state=next_state,
+            target_is_delta=target_is_delta,
+            model_loss_type=model_loss_type,
+            no_delta_list=no_delta_list,
+        )
         loss.backward()
+        if model_loss_type == "va":
+            # Value-aware losses require gradient clipping
+            clip_grad_norm_(self.parameters(), 2.0)
         if meta is not None:
             with torch.no_grad():
                 grad_norm = 0.0
@@ -308,9 +328,7 @@ class Ensemble(Model, abc.ABC):
     # TODO this and eval_score are no longer necessary
     @abc.abstractmethod
     def loss(
-        self,
-        model_in: ModelInput,
-        target: Optional[torch.Tensor] = None,
+        self, model_in: ModelInput, target: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes a loss that can be used to update the model using backpropagation.
 

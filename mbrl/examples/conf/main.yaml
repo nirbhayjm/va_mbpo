@@ -11,6 +11,9 @@ save_video: false
 debug_mode: false
 
 experiment: default
+use_wandb: false
+wandb_project_name: va_mbpo
+wandb_group_name: mbpo_mle
 
 root_dir: "./exp"
 hydra:

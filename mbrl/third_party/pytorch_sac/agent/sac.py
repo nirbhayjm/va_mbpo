@@ -4,9 +4,9 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from mbrl.third_party.pytorch_sac import utils
 from mbrl.third_party.pytorch_sac.agent import Agent
+from torch.nn.utils import clip_grad_norm_
 
 
 class SACAgent(Agent):
@@ -95,7 +95,23 @@ class SACAgent(Agent):
         assert action.ndim == 2
         return utils.to_np(action)
 
-    def update_critic(self, obs, action, reward, next_obs, not_done, logger, step):
+    def update_critic(
+        self,
+        obs,
+        action,
+        reward,
+        next_obs,
+        not_done,
+        logger,
+        step,
+        update_context="policy_training",
+    ):
+        assert update_context in ["policy_training", "model_training"]
+        if update_context == "policy_training":
+            context_prefix_str = "train_critic"
+        else:
+            context_prefix_str = "train_critic_with_model"
+
         dist = self.actor(next_obs)
         next_action = dist.rsample()
         log_prob = dist.log_prob(next_action).sum(-1, keepdim=True)
@@ -109,11 +125,16 @@ class SACAgent(Agent):
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
             current_Q2, target_Q
         )
-        logger.log("train_critic/loss", critic_loss, step)
+        with torch.no_grad():
+            logger.log(
+                f"{context_prefix_str}/mean_Q", target_Q.detach().mean().item(), step,
+            )
+        logger.log(f"{context_prefix_str}/loss", critic_loss, step)
 
         # Optimize the critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        clip_grad_norm_(self.critic.parameters(), 2.0)
         self.critic_optimizer.step()
 
         self.critic.log(logger, step)
@@ -134,6 +155,7 @@ class SACAgent(Agent):
         # optimize the actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        clip_grad_norm_(self.actor.parameters(), 2.0)
         self.actor_optimizer.step()
 
         self.actor.log(logger, step)
@@ -160,6 +182,23 @@ class SACAgent(Agent):
         if step % self.actor_update_frequency == 0:
             self.update_actor_and_alpha(obs, logger, step)
 
+        if step % self.critic_target_update_frequency == 0:
+            utils.soft_update_params(self.critic, self.critic_target, self.critic_tau)
+
+    def update_critic_from_buffer(self, replay_buffer, logger, step):
+        obs, action, reward, next_obs, not_done, not_done_no_max = replay_buffer.sample(
+            self.batch_size
+        )
+        self.update_critic(
+            obs,
+            action,
+            reward,
+            next_obs,
+            not_done_no_max,
+            logger,
+            step,
+            update_context="model_training",
+        )
         if step % self.critic_target_update_frequency == 0:
             utils.soft_update_params(self.critic, self.critic_target, self.critic_tau)
 

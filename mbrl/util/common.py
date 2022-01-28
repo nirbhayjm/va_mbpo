@@ -7,12 +7,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import gym.wrappers
 import hydra
-import numpy as np
-import omegaconf
-
 import mbrl.models
 import mbrl.planning
 import mbrl.types
+import numpy as np
+import omegaconf
+from mbrl.planning.sac_wrapper import SACAgent
 
 from .replay_buffer import (
     BootstrapIterator,
@@ -366,6 +366,10 @@ def train_model_and_save_model_and_data(
     replay_buffer: ReplayBuffer,
     work_dir: Optional[Union[str, pathlib.Path]] = None,
     callback: Optional[Callable] = None,
+    agent: Optional[Union[SACAgent, None]] = None,
+    env_steps: Optional[Union[int, None]] = None,
+    va_refit_callable: Optional[Callable] = None,
+    va_refit_callable_args: Dict = {},
 ):
     """Convenience function for training a model and saving results.
 
@@ -407,6 +411,8 @@ def train_model_and_save_model_and_data(
         patience=cfg.get("patience", 1),
         improvement_threshold=cfg.get("improvement_threshold", 0.01),
         callback=callback,
+        va_refit_callable=va_refit_callable,
+        va_refit_callable_args=va_refit_callable_args,
     )
     if work_dir is not None:
         model.save(str(work_dir))

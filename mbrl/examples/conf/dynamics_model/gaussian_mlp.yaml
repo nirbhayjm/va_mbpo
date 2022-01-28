@@ -7,5 +7,7 @@ out_size: ???
 ensemble_size: 1
 hid_size: 200
 deterministic: false
+va_loss_coeff: 0.01
+va_norm: l1
 activation_fn_cfg:
   _target_: torch.nn.SiLU
